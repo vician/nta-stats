@@ -1,0 +1,54 @@
+services:
+  poller:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nta-poller
+    restart: unless-stopped
+    environment:
+      - NTA_API_KEY=${NTA_API_KEY}
+      - POLL_INTERVAL_SECONDS=${POLL_INTERVAL_SECONDS:-65}
+      - TARGET_AGENCIES=${TARGET_AGENCIES:-Dublin Bus,Go-Ahead Ireland,Iarnród Éireann,Luas}
+      - DB_PATH=/app/data/nta_stats.db
+      - GHOST_GRACE_MINUTES=${GHOST_GRACE_MINUTES:-20}
+    volumes:
+      - nta_data:/app/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Web server service (ready to enable once report_builder generates dist/ HTML pages)
+  # web:
+  #   image: nginx:alpine
+  #   container_name: nta-web
+  #   restart: unless-stopped
+  #   ports:
+  #     - "8080:80"
+  #   volumes:
+  #     - ./dist:/usr/share/nginx/html:ro
+  #   depends_on:
+  #     - poller
+
+  # Optional Grafana dashboard service for SQLite monitoring
+  # grafana:
+  #   image: grafana/grafana:latest
+  #   container_name: nta-grafana
+  #   restart: unless-stopped
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     - GF_SECURITY_ADMIN_PASSWORD=admin
+  #     - GF_INSTALL_PLUGINS=frser-sqlite-datasource
+  #   volumes:
+  #     - nta_data:/var/lib/grafana/data/nta_db:ro
+  #     - grafana_storage:/var/lib/grafana
+  #   depends_on:
+  #     - poller
+
+volumes:
+  nta_data:
+    driver: local
+  # grafana_storage:
+  #   driver: local

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nta-stats"
+version = "0.1.0"
+description = "Irish Public Transport Reliability & Delay Tracker (Dublin Bus, Go-Ahead Ireland, Irish Rail, Luas)"
+authors = [{ name = "NTA Stats Team" }]
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
