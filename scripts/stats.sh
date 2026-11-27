@@ -125,5 +125,5 @@ SELECT
 FROM trips_finalized t
 JOIN static_routes r ON t.route_id = r.route_id
 ORDER BY t.finalized_at DESC
-LIMIT 10;
+LIMIT 100;
 "

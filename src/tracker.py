@@ -334,31 +334,58 @@ class TripStateManager:
             elif tracker.is_active and (
                 tracker.missed_ticks >= self.missed_ticks_threshold or force_all
             ):
-                should_finalize = True
-                # Did the vehicle physically progress near the terminus?
-                # Allow a small buffer (last 15% or 3 stops) since drivers/feeds often
-                # drop updates just before reaching the final terminus stop.
-                terminus_threshold = max(
-                    1,
-                    min(tracker.total_stops - 3, int(tracker.total_stops * 0.85)),
-                )
-                reached_terminus = (
-                    tracker.total_stops > 0
-                    and tracker.max_progress_sequence >= terminus_threshold
+                # Check if the trip actually had physical operation (GPS/vehicle_id or multi-stop progress)
+                has_physical_proof = (
+                    tracker.has_vehicle_position
+                    or tracker.vehicle_id is not None
+                    or tracker.operated_stop_count >= 4
                 )
 
-                if reached_terminus:
-                    _, end_delay, _, _, _ = self._compute_trip_metrics_and_segments(tracker)
-                    delay_val = end_delay or 0
-                    outcome = TripOutcome.LATE if delay_val > 300 else TripOutcome.ON_TIME
-                else:
-                    outcome = TripOutcome.TERMINATED_EARLY
+                # If it was only a pre-trip placeholder (no GPS, no vehicle_id, <=3 stops)
+                # and its scheduled end hasn't passed yet, keep waiting—it may just be waiting to depart!
+                if (
+                    not has_physical_proof
+                    and not force_all
+                    and current_time_seconds <= (tracker.scheduled_end_seconds + self.ghost_grace_seconds)
+                ):
+                    continue
+
+                should_finalize = True
+
+                if not has_physical_proof:
+                    # Never showed physical GPS/vehicle operation and schedule window expired -> GHOST
+                    outcome = TripOutcome.GHOST
                     missing_stops.append((
                         tracker.last_stop_id,
                         tracker.service_date,
                         tracker.route_id,
                         tracker.direction_id,
                     ))
+                else:
+                    # Did the vehicle physically progress near the terminus?
+                    # Allow a small buffer (last 15% or 3 stops) since drivers/feeds often
+                    # drop updates just before reaching the final terminus stop.
+                    terminus_threshold = max(
+                        1,
+                        min(tracker.total_stops - 3, int(tracker.total_stops * 0.85)),
+                    )
+                    reached_terminus = (
+                        tracker.total_stops > 0
+                        and tracker.max_progress_sequence >= terminus_threshold
+                    )
+
+                    if reached_terminus:
+                        _, end_delay, _, _, _ = self._compute_trip_metrics_and_segments(tracker)
+                        delay_val = end_delay or 0
+                        outcome = TripOutcome.LATE if delay_val > 300 else TripOutcome.ON_TIME
+                    else:
+                        outcome = TripOutcome.TERMINATED_EARLY
+                        missing_stops.append((
+                            tracker.last_stop_id,
+                            tracker.service_date,
+                            tracker.route_id,
+                            tracker.direction_id,
+                        ))
 
             if should_finalize and outcome is not None:
                 start_delay, end_delay, max_delay, max_delay_stop_id, segments = (
@@ -376,6 +403,15 @@ class TripStateManager:
                     if tracker.observed_stops else None
                 )
                 is_short_turned = outcome == TripOutcome.TERMINATED_EARLY
+                op_count = (
+                    0
+                    if (
+                        outcome == TripOutcome.CANCELED
+                        and not tracker.has_vehicle_position
+                        and tracker.vehicle_id is None
+                    )
+                    else tracker.operated_stop_count
+                )
 
                 finalized_trip = FinalizedTrip(
                     trip_instance_id=tracker.trip_instance_id,
@@ -390,7 +426,7 @@ class TripStateManager:
                     max_delay_seconds=max_delay,
                     max_delay_stop_id=max_delay_stop_id,
                     scheduled_stop_count=tracker.total_stops,
-                    operated_stop_count=tracker.operated_stop_count,
+                    operated_stop_count=op_count,
                     first_operated_stop_id=first_obs_id,
                     last_operated_stop_id=last_obs_id,
                     is_short_turned=is_short_turned,
