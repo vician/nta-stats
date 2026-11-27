@@ -260,6 +260,15 @@ def increment_scheduled_arrivals(
         conn.executemany(query, stops)
 
 
+def get_finalized_trip_ids(conn: sqlite3.Connection, service_date: str) -> set[str]:
+    """Return set of trip_instance_ids already finalized for a given service date."""
+    cursor = conn.execute(
+        "SELECT trip_instance_id FROM trips_finalized WHERE service_date = ?;",
+        (service_date,),
+    )
+    return {row[0] for row in cursor.fetchall()}
+
+
 def increment_missing_arrivals(
     conn: sqlite3.Connection,
     stops_plan: Iterable[tuple[str, str, str, int]],

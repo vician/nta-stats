@@ -5,16 +5,19 @@ from __future__ import annotations
 import datetime
 import logging
 import signal
+import sqlite3
 import sys
 import time
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 
 from src.config import Config, get_config
 from src.database import (
     get_db_connection,
+    get_finalized_trip_ids,
     increment_missing_arrivals,
     init_db,
     record_segment_delays,
@@ -22,6 +25,8 @@ from src.database import (
 )
 from src.gtfs_static import GTFSStaticManager
 from src.tracker import TripStateManager
+
+DUBLIN_TZ = ZoneInfo("Europe/Dublin")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -105,17 +110,22 @@ class NTAPoller:
         
         Supports mock feeds for deterministic testing.
         """
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(DUBLIN_TZ)
         if service_date is None:
             service_date = now.strftime("%Y-%m-%d")
         if current_time_seconds is None:
             current_time_seconds = now.hour * 3600 + now.minute * 60 + now.second
 
+        # Ensure deduplication set is seeded if starting/rolling over to a new date
+        if self.tracker.current_service_date != service_date:
+            existing_ids = get_finalized_trip_ids(self.conn, service_date)
+            self.tracker.finalized_ids.update(existing_ids)
+
+        self.tracker.begin_tick(service_date)
+
         # 1. Fetch Feeds
         tu_data = mock_trip_updates if mock_trip_updates is not None else self._fetch_feed(self.trip_updates_url)
         veh_data = mock_vehicles if mock_vehicles is not None else self._fetch_feed(self.vehicles_url)
-
-        new_segment_delays = []
 
         # 2. Process Vehicles (GPS)
         vehicles_processed = 0
@@ -129,6 +139,8 @@ class NTAPoller:
                 veh_desc = veh.get("vehicle", {})
                 vehicle_id = veh_desc.get("id") or veh_desc.get("label")
                 ts = int(veh.get("timestamp", time.time()))
+                curr_seq = veh.get("current_stop_sequence")
+                stop_id = veh.get("stop_id")
 
                 if trip_id and vehicle_id:
                     self.tracker.process_vehicle_position(
@@ -136,6 +148,8 @@ class NTAPoller:
                         service_date=service_date,
                         vehicle_id=vehicle_id,
                         timestamp=ts,
+                        current_stop_sequence=curr_seq,
+                        stop_id=stop_id,
                         static_lookup_cb=self.static_manager.get_trip_details,
                     )
                     vehicles_processed += 1
@@ -172,7 +186,7 @@ class NTAPoller:
                         "delay": delay,
                     })
 
-                seg_records = self.tracker.process_trip_update(
+                self.tracker.process_trip_update(
                     trip_id=trip_id,
                     service_date=service_date,
                     schedule_relationship=sched_rel,
@@ -181,12 +195,13 @@ class NTAPoller:
                     timestamp=tu_ts,
                     static_lookup_cb=self.static_manager.get_trip_details,
                 )
-                new_segment_delays.extend(seg_records)
                 trip_updates_processed += 1
 
         # 4. Evaluate completions, cancellations, ghosts, and early terminations
-        finalized_trips, missing_stops = self.tracker.evaluate_and_finalize_trips(
-            current_time_seconds=current_time_seconds
+        finalized_trips, new_segment_delays, missing_stops = (
+            self.tracker.evaluate_and_finalize_trips(
+                current_time_seconds=current_time_seconds
+            )
         )
 
         # 5. Persist to SQLite in WAL mode
@@ -244,13 +259,14 @@ class NTAPoller:
         self.running = False
         try:
             # Final sweep
-            now = datetime.datetime.now(datetime.timezone.utc)
+            now = datetime.datetime.now(DUBLIN_TZ)
             curr_sec = now.hour * 3600 + now.minute * 60 + now.second
-            finalized, missing = self.tracker.evaluate_and_finalize_trips(
+            finalized, segments, missing = self.tracker.evaluate_and_finalize_trips(
                 current_time_seconds=curr_sec,
                 force_all=True,
             )
             save_finalized_trips(self.conn, finalized)
+            record_segment_delays(self.conn, segments)
             increment_missing_arrivals(self.conn, missing)
             self.conn.close()
             logger.info("Flushed %d trips on shutdown.", len(finalized))

@@ -35,18 +35,17 @@ class ActiveTripTracker:
     vehicle_id: str | None = None
     is_active: bool = False
     is_canceled: bool = False
+    has_vehicle_position: bool = False
     last_seen_timestamp: int = 0
-    
-    # Delay metrics
-    start_delay_seconds: int | None = None
-    end_delay_seconds: int | None = None
-    max_delay_seconds: int | None = None
-    max_delay_stop_id: str | None = None
+    seen_in_current_tick: bool = False
+    missed_ticks: int = 0
 
-    # Observed stops keyed by stop_sequence
+    # Physical progress along route (from VehiclePositions.current_stop_sequence
+    # or the earliest upcoming stop_sequence in TripUpdates)
+    max_progress_sequence: int = 0
+
+    # Observed stops keyed by stop_sequence (always holds latest/most accurate delay)
     observed_stops: dict[int, StopObservation] = field(default_factory=dict)
-    # Consecutive segment pairs already emitted: set of (prev_seq, curr_seq)
-    processed_segments: set[tuple[int, int]] = field(default_factory=set)
 
     @property
     def trip_instance_id(self) -> str:
@@ -64,10 +63,30 @@ class ActiveTripTracker:
 class TripStateManager:
     """Orchestrates in-memory trip tracking, classification, and garbage collection."""
 
-    def __init__(self, ghost_grace_seconds: int = 1200):
+    def __init__(
+        self,
+        ghost_grace_seconds: int = 1200,
+        missed_ticks_threshold: int = 2,
+    ):
         # Maps trip_instance_id -> ActiveTripTracker
         self.active_trips: dict[str, ActiveTripTracker] = {}
+        # Deduplication guard: prevents re-tracking/re-finalizing already completed trips
+        self.finalized_ids: set[str] = set()
+        self.current_service_date: str | None = None
         self.ghost_grace_seconds = ghost_grace_seconds
+        self.missed_ticks_threshold = missed_ticks_threshold
+
+    def begin_tick(self, service_date: str) -> None:
+        """Prepare state for a new poll tick."""
+        if self.current_service_date and self.current_service_date != service_date:
+            # Midnight rollover: prune finalized_ids from previous day
+            self.finalized_ids = {
+                fid for fid in self.finalized_ids if fid.startswith(f"{service_date}_")
+            }
+        self.current_service_date = service_date
+
+        for tracker in self.active_trips.values():
+            tracker.seen_in_current_tick = False
 
     def register_scheduled_trip(
         self,
@@ -81,9 +100,11 @@ class TripStateManager:
         first_stop_id: str,
         last_stop_id: str,
         total_stops: int,
-    ) -> ActiveTripTracker:
+    ) -> ActiveTripTracker | None:
         """Register a known scheduled trip into the in-memory pool."""
         instance_id = f"{service_date}_{trip_id}"
+        if instance_id in self.finalized_ids:
+            return None
         if instance_id not in self.active_trips:
             self.active_trips[instance_id] = ActiveTripTracker(
                 trip_id=trip_id,
@@ -108,15 +129,14 @@ class TripStateManager:
         vehicle_id: str | None = None,
         timestamp: int = 0,
         static_lookup_cb=None,
-    ) -> list[SegmentDelayRecord]:
-        """Update trip state from GTFS-R TripUpdates feed.
-        
-        Returns newly detected SegmentDelayRecords for stop-level congestion rollups.
-        """
+    ) -> None:
+        """Update trip state from GTFS-R TripUpdates feed."""
         instance_id = f"{service_date}_{trip_id}"
+        if instance_id in self.finalized_ids:
+            return
+
         tracker = self.active_trips.get(instance_id)
 
-        # If not tracked yet, query static schedule callback if provided
         if tracker is None and static_lookup_cb:
             meta = static_lookup_cb(trip_id)
             if meta:
@@ -134,10 +154,11 @@ class TripStateManager:
                 )
 
         if tracker is None:
-            # Trip not part of targeted schedule
-            return []
+            return
 
         tracker.is_active = True
+        tracker.seen_in_current_tick = True
+        tracker.missed_ticks = 0
         tracker.last_seen_timestamp = max(tracker.last_seen_timestamp, timestamp)
         if vehicle_id:
             tracker.vehicle_id = vehicle_id
@@ -145,9 +166,7 @@ class TripStateManager:
         # Check explicit cancellation
         if schedule_relationship and schedule_relationship.upper() in ("CANCELED", "CANCELLED", "3"):
             tracker.is_canceled = True
-            return []
-
-        new_segments: list[SegmentDelayRecord] = []
+            return
 
         # Sort incoming stop updates by sequence
         valid_updates = []
@@ -156,60 +175,29 @@ class TripStateManager:
             s_id = upd.get("stop_id", "")
             delay = upd.get("delay")
             if delay is None:
-                # May have arrival/departure delay
                 delay = upd.get("arrival_delay", upd.get("departure_delay", 0))
 
             if seq is not None:
                 valid_updates.append((int(seq), s_id, int(delay)))
 
+        if not valid_updates:
+            return
+
         valid_updates.sort(key=lambda x: x[0])
 
+        # The smallest stop_sequence in TripUpdates typically represents the vehicle's
+        # current/next upcoming stop along the route.
+        min_upcoming_seq = valid_updates[0][0]
+        if min_upcoming_seq > tracker.max_progress_sequence:
+            tracker.max_progress_sequence = min_upcoming_seq
+
         for seq, s_id, delay in valid_updates:
-            obs = StopObservation(
+            tracker.observed_stops[seq] = StopObservation(
                 stop_id=s_id,
                 stop_sequence=seq,
                 delay_seconds=delay,
                 observed_at=timestamp,
             )
-            tracker.observed_stops[seq] = obs
-
-            # Update start delay if first sequence
-            if seq == 1 or tracker.start_delay_seconds is None:
-                tracker.start_delay_seconds = delay
-
-            # Update peak delay
-            if tracker.max_delay_seconds is None or delay > tracker.max_delay_seconds:
-                tracker.max_delay_seconds = delay
-                tracker.max_delay_stop_id = s_id
-
-            # End delay is updated to the latest stop sequence observed
-            tracker.end_delay_seconds = delay
-
-        # Compute newly completed stop-to-stop segment delays
-        sorted_observed_seqs = sorted(tracker.observed_stops.keys())
-        for i in range(len(sorted_observed_seqs) - 1):
-            prev_seq = sorted_observed_seqs[i]
-            curr_seq = sorted_observed_seqs[i + 1]
-            seg_key = (prev_seq, curr_seq)
-
-            if seg_key not in tracker.processed_segments:
-                tracker.processed_segments.add(seg_key)
-                prev_obs = tracker.observed_stops[prev_seq]
-                curr_obs = tracker.observed_stops[curr_seq]
-                # Added delay is delay at B minus delay at A
-                added = curr_obs.delay_seconds - prev_obs.delay_seconds
-                new_segments.append(
-                    SegmentDelayRecord(
-                        stop_id=curr_obs.stop_id,
-                        service_date=tracker.service_date,
-                        route_id=tracker.route_id,
-                        direction_id=tracker.direction_id,
-                        arrival_delay_seconds=curr_obs.delay_seconds,
-                        added_delay_seconds=added,
-                    )
-                )
-
-        return new_segments
 
     def process_vehicle_position(
         self,
@@ -221,8 +209,11 @@ class TripStateManager:
         stop_id: str | None = None,
         static_lookup_cb=None,
     ) -> None:
-        """Process vehicle GPS position to confirm live physical operation."""
+        """Process vehicle GPS position to confirm live physical operation and progress."""
         instance_id = f"{service_date}_{trip_id}"
+        if instance_id in self.finalized_ids:
+            return
+
         tracker = self.active_trips.get(instance_id)
 
         if tracker is None and static_lookup_cb:
@@ -243,24 +234,75 @@ class TripStateManager:
 
         if tracker:
             tracker.is_active = True
+            tracker.has_vehicle_position = True
+            tracker.seen_in_current_tick = True
+            tracker.missed_ticks = 0
             tracker.vehicle_id = vehicle_id
             tracker.last_seen_timestamp = max(tracker.last_seen_timestamp, timestamp)
+            if current_stop_sequence is not None:
+                seq = int(current_stop_sequence)
+                if seq > tracker.max_progress_sequence:
+                    tracker.max_progress_sequence = seq
+
+    def _compute_trip_metrics_and_segments(
+        self, tracker: ActiveTripTracker
+    ) -> tuple[int | None, int | None, int | None, str | None, list[SegmentDelayRecord]]:
+        """Compute start, end, peak delays and segment delays from final observed stops."""
+        if not tracker.observed_stops:
+            return None, None, None, None, []
+
+        sorted_seqs = sorted(tracker.observed_stops.keys())
+        start_delay = tracker.observed_stops[sorted_seqs[0]].delay_seconds
+        end_delay = tracker.observed_stops[sorted_seqs[-1]].delay_seconds
+
+        max_delay: int | None = None
+        max_delay_stop_id: str | None = None
+        for seq in sorted_seqs:
+            obs = tracker.observed_stops[seq]
+            if max_delay is None or obs.delay_seconds > max_delay:
+                max_delay = obs.delay_seconds
+                max_delay_stop_id = obs.stop_id
+
+        segments: list[SegmentDelayRecord] = []
+        for i in range(len(sorted_seqs) - 1):
+            prev_obs = tracker.observed_stops[sorted_seqs[i]]
+            curr_obs = tracker.observed_stops[sorted_seqs[i + 1]]
+            added = curr_obs.delay_seconds - prev_obs.delay_seconds
+            segments.append(
+                SegmentDelayRecord(
+                    stop_id=curr_obs.stop_id,
+                    service_date=tracker.service_date,
+                    route_id=tracker.route_id,
+                    direction_id=tracker.direction_id,
+                    arrival_delay_seconds=curr_obs.delay_seconds,
+                    added_delay_seconds=added,
+                )
+            )
+
+        return start_delay, end_delay, max_delay, max_delay_stop_id, segments
 
     def evaluate_and_finalize_trips(
         self,
         current_time_seconds: int,
         force_all: bool = False,
-    ) -> tuple[list[FinalizedTrip], list[tuple[str, str, str, int]]]:
+    ) -> tuple[list[FinalizedTrip], list[SegmentDelayRecord], list[tuple[str, str, str, int]]]:
         """Examine in-memory trips, classify completed/expired ones, and evict them.
         
+        Trips that are still actively reporting in the live feed are kept in memory
+        until they disappear from the feed (or are explicitly canceled).
+        
         Returns:
-            (finalized_trips, missing_stops_to_record)
+            (finalized_trips, segment_delays, missing_stops_to_record)
         """
         finalized: list[FinalizedTrip] = []
+        all_segments: list[SegmentDelayRecord] = []
         missing_stops: list[tuple[str, str, str, int]] = []
         to_evict: list[str] = []
 
         for instance_id, tracker in self.active_trips.items():
+            if not tracker.seen_in_current_tick:
+                tracker.missed_ticks += 1
+
             should_finalize = False
             outcome: TripOutcome | None = None
 
@@ -269,45 +311,18 @@ class TripStateManager:
                 should_finalize = True
                 outcome = TripOutcome.CANCELED
 
-            # Case 2: Reached scheduled terminus (or final stop sequence)
-            elif tracker.last_observed_sequence >= tracker.total_stops and tracker.total_stops > 0:
-                should_finalize = True
-                end_delay = tracker.end_delay_seconds or 0
-                if -60 <= end_delay <= 300:
-                    outcome = TripOutcome.ON_TIME
-                else:
-                    outcome = TripOutcome.LATE
-
-            # Case 3: Ghost Bus
-            # Scheduled time window passed + grace period, and never had any GPS ping or observed stops
+            # Case 2: Ghost Bus
+            # Scheduled time window passed + grace period, never appeared in GPS or TripUpdates
             elif (
                 not tracker.is_active
                 and len(tracker.observed_stops) == 0
-                and current_time_seconds > (tracker.scheduled_end_seconds + self.ghost_grace_seconds)
-            ):
-                should_finalize = True
-                outcome = TripOutcome.GHOST
-                # Mark scheduled terminus/stops as missing
-                missing_stops.append((
-                    tracker.last_stop_id,
-                    tracker.service_date,
-                    tracker.route_id,
-                    tracker.direction_id,
-                ))
-
-            # Case 4: Terminated Early / Short-Turned
-            # Vehicle stopped reporting updates, time window passed, but last stop was short of terminus
-            elif (
-                tracker.is_active
-                and tracker.last_observed_sequence < tracker.total_stops
                 and (
                     current_time_seconds > (tracker.scheduled_end_seconds + self.ghost_grace_seconds)
                     or force_all
                 )
             ):
                 should_finalize = True
-                outcome = TripOutcome.TERMINATED_EARLY
-                # Mark final unreached stop as missing
+                outcome = TripOutcome.GHOST
                 missing_stops.append((
                     tracker.last_stop_id,
                     tracker.service_date,
@@ -315,19 +330,39 @@ class TripStateManager:
                     tracker.direction_id,
                 ))
 
-            # Case 5: Force finalize (e.g. shutdown or end-of-day rollover)
-            elif force_all:
+            # Case 3: Active trip has disappeared from the feed for >= missed_ticks_threshold
+            elif tracker.is_active and (
+                tracker.missed_ticks >= self.missed_ticks_threshold or force_all
+            ):
                 should_finalize = True
-                if tracker.is_active and len(tracker.observed_stops) > 0:
-                    end_delay = tracker.end_delay_seconds or 0
-                    if tracker.last_observed_sequence >= tracker.total_stops:
-                        outcome = TripOutcome.ON_TIME if -60 <= end_delay <= 300 else TripOutcome.LATE
-                    else:
-                        outcome = TripOutcome.TERMINATED_EARLY
+                # Did the vehicle physically progress near the terminus?
+                # Allow a 2-stop buffer at the end since drivers often log off 1-2 stops early.
+                terminus_threshold = max(1, tracker.total_stops - 2)
+                reached_terminus = (
+                    tracker.total_stops > 0
+                    and tracker.max_progress_sequence >= terminus_threshold
+                )
+
+                if reached_terminus:
+                    _, end_delay, _, _, _ = self._compute_trip_metrics_and_segments(tracker)
+                    delay_val = end_delay or 0
+                    outcome = TripOutcome.ON_TIME if -60 <= delay_val <= 300 else TripOutcome.LATE
                 else:
-                    outcome = TripOutcome.GHOST
+                    outcome = TripOutcome.TERMINATED_EARLY
+                    missing_stops.append((
+                        tracker.last_stop_id,
+                        tracker.service_date,
+                        tracker.route_id,
+                        tracker.direction_id,
+                    ))
 
             if should_finalize and outcome is not None:
+                start_delay, end_delay, max_delay, max_delay_stop_id, segments = (
+                    self._compute_trip_metrics_and_segments(tracker)
+                )
+                if outcome in (TripOutcome.ON_TIME, TripOutcome.LATE, TripOutcome.TERMINATED_EARLY):
+                    all_segments.extend(segments)
+
                 first_obs_id = (
                     tracker.observed_stops[min(tracker.observed_stops.keys())].stop_id
                     if tracker.observed_stops else None
@@ -336,10 +371,7 @@ class TripStateManager:
                     tracker.observed_stops[tracker.last_observed_sequence].stop_id
                     if tracker.observed_stops else None
                 )
-                is_short_turned = (
-                    outcome == TripOutcome.TERMINATED_EARLY
-                    or (tracker.last_observed_sequence < tracker.total_stops and tracker.operated_stop_count > 0)
-                )
+                is_short_turned = outcome == TripOutcome.TERMINATED_EARLY
 
                 finalized_trip = FinalizedTrip(
                     trip_instance_id=tracker.trip_instance_id,
@@ -349,14 +381,10 @@ class TripStateManager:
                     service_date=tracker.service_date,
                     classification=outcome,
                     vehicle_id=tracker.vehicle_id,
-                    scheduled_start_time=None,
-                    scheduled_end_time=None,
-                    actual_start_time=None,
-                    actual_end_time=None,
-                    start_delay_seconds=tracker.start_delay_seconds,
-                    end_delay_seconds=tracker.end_delay_seconds,
-                    max_delay_seconds=tracker.max_delay_seconds,
-                    max_delay_stop_id=tracker.max_delay_stop_id,
+                    start_delay_seconds=start_delay,
+                    end_delay_seconds=end_delay,
+                    max_delay_seconds=max_delay,
+                    max_delay_stop_id=max_delay_stop_id,
                     scheduled_stop_count=tracker.total_stops,
                     operated_stop_count=tracker.operated_stop_count,
                     first_operated_stop_id=first_obs_id,
@@ -366,11 +394,16 @@ class TripStateManager:
                 finalized.append(finalized_trip)
                 to_evict.append(instance_id)
 
-        # Evict finalized trips from memory to keep footprint bounded
+        # Evict finalized trips from memory and record in deduplication set
         for inst_id in to_evict:
             del self.active_trips[inst_id]
+            self.finalized_ids.add(inst_id)
 
         if finalized:
-            logger.info("Finalized %d trips (evicted from memory).", len(finalized))
+            logger.info(
+                "Finalized %d trips (%d still active in memory).",
+                len(finalized),
+                len(self.active_trips),
+            )
 
-        return finalized, missing_stops
+        return finalized, all_segments, missing_stops
