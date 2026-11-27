@@ -346,7 +346,7 @@ class TripStateManager:
                 if reached_terminus:
                     _, end_delay, _, _, _ = self._compute_trip_metrics_and_segments(tracker)
                     delay_val = end_delay or 0
-                    outcome = TripOutcome.ON_TIME if -60 <= delay_val <= 300 else TripOutcome.LATE
+                    outcome = TripOutcome.LATE if delay_val > 300 else TripOutcome.ON_TIME
                 else:
                     outcome = TripOutcome.TERMINATED_EARLY
                     missing_stops.append((
