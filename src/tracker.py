@@ -66,7 +66,7 @@ class TripStateManager:
     def __init__(
         self,
         ghost_grace_seconds: int = 1200,
-        missed_ticks_threshold: int = 2,
+        missed_ticks_threshold: int = 5,
     ):
         # Maps trip_instance_id -> ActiveTripTracker
         self.active_trips: dict[str, ActiveTripTracker] = {}
@@ -336,8 +336,12 @@ class TripStateManager:
             ):
                 should_finalize = True
                 # Did the vehicle physically progress near the terminus?
-                # Allow a 2-stop buffer at the end since drivers often log off 1-2 stops early.
-                terminus_threshold = max(1, tracker.total_stops - 2)
+                # Allow a small buffer (last 15% or 3 stops) since drivers/feeds often
+                # drop updates just before reaching the final terminus stop.
+                terminus_threshold = max(
+                    1,
+                    min(tracker.total_stops - 3, int(tracker.total_stops * 0.85)),
+                )
                 reached_terminus = (
                     tracker.total_stops > 0
                     and tracker.max_progress_sequence >= terminus_threshold
