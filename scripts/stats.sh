@@ -20,7 +20,7 @@ run_sql() {
 }
 
 echo "=================================================================="
-echo " 1. OVERALL RELIABILITY BREAKDOWN"
+echo " 1. OVERALL RELIABILITY BREAKDOWN (Tracked Vehicles & Cancellations)"
 echo "=================================================================="
 run_sql "
 SELECT 
@@ -28,13 +28,14 @@ SELECT
     COUNT(*) AS total_trips,
     ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 1) || '%' AS percentage
 FROM trips_finalized
+WHERE vehicle_id IS NOT NULL OR classification IN ('CANCELED', 'GHOST')
 GROUP BY classification
 ORDER BY total_trips DESC;
 "
 
 echo ""
 echo "=================================================================="
-echo " 2. WORST-PERFORMING ROUTES LEADERBOARD (min 5 trips)"
+echo " 2. WORST-PERFORMING ROUTES LEADERBOARD (Bus & Rail, min 5 trips)"
 echo "=================================================================="
 run_sql "
 SELECT 
@@ -44,9 +45,11 @@ SELECT
     SUM(CASE WHEN t.classification = 'LATE' THEN 1 ELSE 0 END) AS late,
     SUM(CASE WHEN t.classification IN ('CANCELED', 'GHOST') THEN 1 ELSE 0 END) AS ghost_or_canceled,
     SUM(CASE WHEN t.classification = 'TERMINATED_EARLY' THEN 1 ELSE 0 END) AS short_turned,
-    ROUND(AVG(t.end_delay_seconds) / 60.0, 1) AS avg_delay_mins
+    ROUND(AVG(CASE WHEN t.vehicle_id IS NOT NULL THEN t.end_delay_seconds END) / 60.0, 1) AS avg_delay_mins
 FROM trips_finalized t
 JOIN static_routes r ON t.route_id = r.route_id
+WHERE r.route_type != 0
+  AND (t.vehicle_id IS NOT NULL OR t.classification IN ('CANCELED', 'GHOST'))
 GROUP BY r.route_short_name
 HAVING total_trips >= 5
 ORDER BY (SUM(CASE WHEN t.classification = 'ON_TIME' THEN 1.0 ELSE 0 END) / COUNT(*)) ASC
@@ -55,7 +58,7 @@ LIMIT 15;
 
 echo ""
 echo "=================================================================="
-echo " 3. CANCELED TRIPS BY ROUTE"
+echo " 3. CANCELED TRIPS BY ROUTE (All Operators)"
 echo "=================================================================="
 run_sql "
 SELECT 
@@ -70,7 +73,7 @@ ORDER BY canceled_count DESC;
 
 echo ""
 echo "=================================================================="
-echo " 4. TIMETABLE PADDING EXPOSED (Peak Mid-Route vs. Terminus Delay)"
+echo " 4. TIMETABLE PADDING EXPOSED (GPS-Tracked Bus/Rail, Excl. Luas)"
 echo "=================================================================="
 run_sql "
 SELECT 
@@ -84,14 +87,16 @@ SELECT
 FROM trips_finalized t
 JOIN static_routes r ON t.route_id = r.route_id
 LEFT JOIN static_stops s ON t.max_delay_stop_id = s.stop_id
-WHERE t.max_delay_seconds >= 600
+WHERE r.route_type != 0
+  AND t.vehicle_id IS NOT NULL
+  AND t.max_delay_seconds >= 600
 ORDER BY (t.max_delay_seconds - t.end_delay_seconds) DESC
 LIMIT 10;
 "
 
 echo ""
 echo "=================================================================="
-echo " 5. TOP 10 BOTTLENECK STOPS (Added Segment Delay)"
+echo " 5. TOP 10 BOTTLENECK STOPS (Added Segment Delay, Excl. Luas)"
 echo "=================================================================="
 run_sql "
 SELECT 
@@ -104,7 +109,8 @@ SELECT
 FROM stop_daily_stats d
 JOIN static_stops s ON d.stop_id = s.stop_id
 JOIN static_routes r ON d.route_id = r.route_id
-WHERE d.observed_arrivals >= 3
+WHERE r.route_type != 0
+  AND d.observed_arrivals >= 3
 ORDER BY d.cumulative_added_delay_seconds DESC
 LIMIT 10;
 "
@@ -125,5 +131,5 @@ SELECT
 FROM trips_finalized t
 JOIN static_routes r ON t.route_id = r.route_id
 ORDER BY t.finalized_at DESC
-LIMIT 100;
+LIMIT 10;
 "
