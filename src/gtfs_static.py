@@ -6,6 +6,7 @@ import csv
 import io
 import logging
 import sqlite3
+import tempfile
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -41,11 +42,16 @@ class GTFSStaticManager:
         self.config = config
         self.conn = conn
 
-    def download_and_ingest(self, zip_source: str | Path | None = None) -> dict[str, int]:
+    def download_and_ingest(
+        self,
+        zip_source: str | Path | None = None,
+        store_stop_times: bool = False,
+    ) -> dict[str, int]:
         """Download or read GTFS zip, parse target agencies, and populate SQLite tables.
         
         Args:
             zip_source: Local file path or URL. Defaults to config.gtfs_static_url.
+            store_stop_times: If True, also store all stop_times rows (millions of rows).
             
         Returns:
             Dictionary with counts of ingested entities.
@@ -55,17 +61,24 @@ class GTFSStaticManager:
 
         if isinstance(zip_source, str) and zip_source.startswith("http"):
             logger.info("Downloading GTFS static archive from %s...", zip_source)
-            resp = requests.get(zip_source, timeout=120)
-            resp.raise_for_status()
-            zip_bytes = io.BytesIO(resp.content)
-            archive = zipfile.ZipFile(zip_bytes)
-        else:
-            archive = zipfile.ZipFile(zip_source)
+            with tempfile.NamedTemporaryFile(suffix=".zip", delete=True) as tmp_file:
+                with requests.get(zip_source, stream=True, timeout=120) as resp:
+                    resp.raise_for_status()
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            tmp_file.write(chunk)
+                tmp_file.flush()
+                with zipfile.ZipFile(tmp_file.name) as archive:
+                    return self._parse_and_insert(archive, store_stop_times=store_stop_times)
 
-        with archive:
-            return self._parse_and_insert(archive)
+        with zipfile.ZipFile(zip_source) as archive:
+            return self._parse_and_insert(archive, store_stop_times=store_stop_times)
 
-    def _parse_and_insert(self, archive: zipfile.ZipFile) -> dict[str, int]:
+    def _parse_and_insert(
+        self,
+        archive: zipfile.ZipFile,
+        store_stop_times: bool = False,
+    ) -> dict[str, int]:
         """Parse GTFS zip file streams and populate SQLite in a single transaction."""
         namelist = set(archive.namelist())
         for required in ("agency.txt", "routes.txt", "trips.txt", "stops.txt", "stop_times.txt"):
@@ -140,50 +153,74 @@ class GTFSStaticManager:
 
         logger.info("Found %d trips for target routes", len(target_trip_ids))
 
-        # 4. Parse stop_times for target trips to compute start/end bounds and sequences
-        trip_stop_times: dict[str, list[tuple[int, str, int, int]]] = {}
+        # 4. Stream stop_times for target trips to compute start/end bounds in low memory
+        # Maps trip_id -> [min_seq, first_stop_id, start_dep, max_seq, last_stop_id, end_arr, count]
+        trip_bounds: dict[str, list[Any]] = {}
         target_stop_ids: set[str] = set()
+        stop_time_rows: list[tuple[str, int, str, int, int]] = []
+        stop_times_processed = 0
 
         with archive.open("stop_times.txt") as f:
             reader = csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig"))
             for row in reader:
                 t_id = row.get("trip_id", "").strip()
-                if t_id in target_trip_ids:
-                    seq = int(row["stop_sequence"])
-                    s_id = row["stop_id"].strip()
+                if t_id not in target_trip_ids:
+                    continue
+
+                seq = int(row["stop_sequence"])
+                s_id = row["stop_id"].strip()
+                target_stop_ids.add(s_id)
+                stop_times_processed += 1
+
+                bounds = trip_bounds.get(t_id)
+                if bounds is None:
                     arr_sec = time_str_to_seconds(row["arrival_time"])
                     dep_sec = time_str_to_seconds(row["departure_time"])
-                    
-                    target_stop_ids.add(s_id)
-                    if t_id not in trip_stop_times:
-                        trip_stop_times[t_id] = []
-                    trip_stop_times[t_id].append((seq, s_id, arr_sec, dep_sec))
+                    trip_bounds[t_id] = [seq, s_id, dep_sec, seq, s_id, arr_sec, 1]
+                    if store_stop_times:
+                        stop_time_rows.append((t_id, seq, s_id, arr_sec, dep_sec))
+                else:
+                    bounds[6] += 1
+                    arr_sec = None
+                    dep_sec = None
+                    if seq < bounds[0]:
+                        dep_sec = time_str_to_seconds(row["departure_time"])
+                        bounds[0] = seq
+                        bounds[1] = s_id
+                        bounds[2] = dep_sec
+                    if seq > bounds[3]:
+                        arr_sec = time_str_to_seconds(row["arrival_time"])
+                        bounds[3] = seq
+                        bounds[4] = s_id
+                        bounds[5] = arr_sec
+                    if store_stop_times:
+                        if arr_sec is None:
+                            arr_sec = time_str_to_seconds(row["arrival_time"])
+                        if dep_sec is None:
+                            dep_sec = time_str_to_seconds(row["departure_time"])
+                        stop_time_rows.append((t_id, seq, s_id, arr_sec, dep_sec))
 
-        # Build final static_trips and static_trip_stop_times records
+        # Build final static_trips records
         trip_final_rows = []
-        stop_time_rows = []
-
-        for t_id, stops in trip_stop_times.items():
-            stops.sort(key=lambda x: x[0])  # Sort by sequence
-            first_seq, first_stop_id, start_arr, start_dep = stops[0]
-            last_seq, last_stop_id, end_arr, end_dep = stops[-1]
+        for t_id, bounds in trip_bounds.items():
             pre = trip_pre_rows[t_id]
-
             trip_final_rows.append((
                 t_id,
                 pre["route_id"],
                 pre["service_id"],
                 pre["trip_headsign"],
                 pre["direction_id"],
-                start_dep,
-                end_arr,
-                first_stop_id,
-                last_stop_id,
-                len(stops),
+                bounds[2],  # start_dep
+                bounds[5],  # end_arr
+                bounds[1],  # first_stop_id
+                bounds[4],  # last_stop_id
+                bounds[6],  # total_stops
             ))
 
-            for seq, s_id, arr_s, dep_s in stops:
-                stop_time_rows.append((t_id, seq, s_id, arr_s, dep_s))
+        # Free temporary dicts before DB insert
+        trip_bounds.clear()
+        trip_pre_rows.clear()
+        target_trip_ids.clear()
 
         # 5. Parse Stops
         stop_rows = []
@@ -220,16 +257,17 @@ class GTFSStaticManager:
                 "INSERT OR REPLACE INTO static_trips VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
                 trip_final_rows,
             )
-            self.conn.executemany(
-                "INSERT OR REPLACE INTO static_trip_stop_times VALUES (?, ?, ?, ?, ?);",
-                stop_time_rows,
-            )
+            if store_stop_times and stop_time_rows:
+                self.conn.executemany(
+                    "INSERT OR REPLACE INTO static_trip_stop_times VALUES (?, ?, ?, ?, ?);",
+                    stop_time_rows,
+                )
 
         counts["agencies"] = len(agency_rows)
         counts["routes"] = len(route_rows)
         counts["stops"] = len(stop_rows)
         counts["trips"] = len(trip_final_rows)
-        counts["stop_times"] = len(stop_time_rows)
+        counts["stop_times"] = stop_times_processed
         logger.info("Ingested GTFS static data successfully: %s", counts)
         return counts
 
