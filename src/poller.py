@@ -22,6 +22,7 @@ from src.database import (
     init_db,
     record_segment_delays,
     save_finalized_trips,
+    _migrate_db,
 )
 from src.gtfs_static import GTFSStaticManager
 from src.tracker import TripStateManager
@@ -47,6 +48,7 @@ class NTAPoller:
         self.config = config or get_config()
         self.conn = conn or get_db_connection(self.config.db_path)
         init_db(self.conn)
+        _migrate_db(self.conn)
 
         self.static_manager = GTFSStaticManager(self.config, self.conn)
         self.tracker = TripStateManager(
@@ -167,6 +169,7 @@ class NTAPoller:
                     continue
 
                 sched_rel = trip_desc.get("schedule_relationship")
+                gtfsr_start_time = trip_desc.get("start_time")  # e.g. "08:45:00"
                 veh_info = tu.get("vehicle", {})
                 vehicle_id = veh_info.get("id") or veh_info.get("label")
                 tu_ts = int(tu.get("timestamp", time.time()))
@@ -193,6 +196,7 @@ class NTAPoller:
                     stop_updates=stop_updates,
                     vehicle_id=vehicle_id,
                     timestamp=tu_ts,
+                    gtfsr_start_time=gtfsr_start_time,
                     static_lookup_cb=self.static_manager.get_trip_details,
                 )
                 trip_updates_processed += 1

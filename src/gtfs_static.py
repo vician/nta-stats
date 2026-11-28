@@ -234,13 +234,16 @@ class GTFSStaticManager:
         return counts
 
     def get_trip_details(self, trip_id: str) -> dict[str, Any] | None:
-        """Fetch static trip metadata including schedule bounds and route."""
+        """Fetch static trip metadata including schedule bounds, route, headsign and first stop name."""
         cursor = self.conn.execute("""
             SELECT t.trip_id, t.route_id, r.agency_id, t.direction_id,
                    t.scheduled_start_seconds, t.scheduled_end_seconds,
-                   t.first_stop_id, t.last_stop_id, t.total_stops
+                   t.first_stop_id, t.last_stop_id, t.total_stops,
+                   t.trip_headsign,
+                   s.stop_name AS first_stop_name
             FROM static_trips t
             JOIN static_routes r ON t.route_id = r.route_id
+            LEFT JOIN static_stops s ON t.first_stop_id = s.stop_id
             WHERE t.trip_id = ?;
         """, (trip_id,))
         row = cursor.fetchone()

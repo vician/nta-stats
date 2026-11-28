@@ -29,6 +29,21 @@ def get_db_connection(db_path: Path | str) -> sqlite3.Connection:
     return conn
 
 
+def _migrate_db(conn: sqlite3.Connection) -> None:
+    """Apply lightweight schema migrations for columns added after initial release."""
+    existing_cols = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(trips_finalized);").fetchall()
+    }
+    with conn:
+        if "gtfsr_start_time" not in existing_cols:
+            conn.execute("ALTER TABLE trips_finalized ADD COLUMN gtfsr_start_time TEXT;")
+        if "trip_headsign" not in existing_cols:
+            conn.execute("ALTER TABLE trips_finalized ADD COLUMN trip_headsign TEXT;")
+        if "first_stop_name" not in existing_cols:
+            conn.execute("ALTER TABLE trips_finalized ADD COLUMN first_stop_name TEXT;")
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     """Initialize database tables and indices."""
     with conn:
@@ -109,6 +124,10 @@ def init_db(conn: sqlite3.Connection) -> None:
             first_operated_stop_id TEXT,
             last_operated_stop_id TEXT,
             is_short_turned BOOLEAN DEFAULT 0,
+
+            gtfsr_start_time TEXT,
+            trip_headsign TEXT,
+            first_stop_name TEXT,
             
             finalized_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (route_id) REFERENCES static_routes(route_id)
@@ -143,6 +162,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_stop_daily_stats_date_route 
             ON stop_daily_stats(service_date, route_id);
         """)
+    _migrate_db(conn)
 
 
 def save_finalized_trips(conn: sqlite3.Connection, trips: Iterable[FinalizedTrip]) -> int:
@@ -158,14 +178,16 @@ def save_finalized_trips(conn: sqlite3.Connection, trips: Iterable[FinalizedTrip
         scheduled_start_time, scheduled_end_time, actual_start_time, actual_end_time,
         start_delay_seconds, end_delay_seconds, max_delay_seconds, max_delay_stop_id,
         scheduled_stop_count, operated_stop_count,
-        first_operated_stop_id, last_operated_stop_id, is_short_turned
+        first_operated_stop_id, last_operated_stop_id, is_short_turned,
+        gtfsr_start_time, trip_headsign, first_stop_name
     ) VALUES (
         :trip_instance_id, :trip_id, :route_id, :agency_id, :service_date,
         :vehicle_id, :classification,
         :scheduled_start_time, :scheduled_end_time, :actual_start_time, :actual_end_time,
         :start_delay_seconds, :end_delay_seconds, :max_delay_seconds, :max_delay_stop_id,
         :scheduled_stop_count, :operated_stop_count,
-        :first_operated_stop_id, :last_operated_stop_id, :is_short_turned
+        :first_operated_stop_id, :last_operated_stop_id, :is_short_turned,
+        :gtfsr_start_time, :trip_headsign, :first_stop_name
     );
     """
     params = [
@@ -190,6 +212,9 @@ def save_finalized_trips(conn: sqlite3.Connection, trips: Iterable[FinalizedTrip
             "first_operated_stop_id": t.first_operated_stop_id,
             "last_operated_stop_id": t.last_operated_stop_id,
             "is_short_turned": 1 if t.is_short_turned else 0,
+            "gtfsr_start_time": t.gtfsr_start_time,
+            "trip_headsign": t.trip_headsign,
+            "first_stop_name": t.first_stop_name,
         }
         for t in trip_list
     ]

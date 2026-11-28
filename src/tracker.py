@@ -31,6 +31,10 @@ class ActiveTripTracker:
     last_stop_id: str
     total_stops: int
 
+    # Static schedule context (enriched at registration time from static_trips/stops)
+    trip_headsign: str | None = None
+    first_stop_name: str | None = None
+
     # Live tracking state
     vehicle_id: str | None = None
     is_active: bool = False
@@ -39,6 +43,9 @@ class ActiveTripTracker:
     last_seen_timestamp: int = 0
     seen_in_current_tick: bool = False
     missed_ticks: int = 0
+
+    # Scheduled departure time from the GTFS-R feed trip descriptor (HH:MM:SS)
+    gtfsr_start_time: str | None = None
 
     # Physical progress along route (from VehiclePositions.current_stop_sequence
     # or the earliest upcoming stop_sequence in TripUpdates)
@@ -100,6 +107,8 @@ class TripStateManager:
         first_stop_id: str,
         last_stop_id: str,
         total_stops: int,
+        trip_headsign: str | None = None,
+        first_stop_name: str | None = None,
     ) -> ActiveTripTracker | None:
         """Register a known scheduled trip into the in-memory pool."""
         instance_id = f"{service_date}_{trip_id}"
@@ -117,6 +126,8 @@ class TripStateManager:
                 first_stop_id=first_stop_id,
                 last_stop_id=last_stop_id,
                 total_stops=total_stops,
+                trip_headsign=trip_headsign,
+                first_stop_name=first_stop_name,
             )
         return self.active_trips[instance_id]
 
@@ -128,6 +139,7 @@ class TripStateManager:
         stop_updates: list[dict[str, Any]],
         vehicle_id: str | None = None,
         timestamp: int = 0,
+        gtfsr_start_time: str | None = None,
         static_lookup_cb=None,
     ) -> None:
         """Update trip state from GTFS-R TripUpdates feed."""
@@ -151,6 +163,8 @@ class TripStateManager:
                     first_stop_id=meta["first_stop_id"],
                     last_stop_id=meta["last_stop_id"],
                     total_stops=meta["total_stops"],
+                    trip_headsign=meta.get("trip_headsign"),
+                    first_stop_name=meta.get("first_stop_name"),
                 )
 
         if tracker is None:
@@ -162,6 +176,8 @@ class TripStateManager:
         tracker.last_seen_timestamp = max(tracker.last_seen_timestamp, timestamp)
         if vehicle_id:
             tracker.vehicle_id = vehicle_id
+        if gtfsr_start_time and not tracker.gtfsr_start_time:
+            tracker.gtfsr_start_time = gtfsr_start_time
 
         # Check explicit cancellation
         if schedule_relationship and schedule_relationship.upper() in ("CANCELED", "CANCELLED", "3"):
@@ -230,6 +246,8 @@ class TripStateManager:
                     first_stop_id=meta["first_stop_id"],
                     last_stop_id=meta["last_stop_id"],
                     total_stops=meta["total_stops"],
+                    trip_headsign=meta.get("trip_headsign"),
+                    first_stop_name=meta.get("first_stop_name"),
                 )
 
         if tracker:
@@ -285,6 +303,7 @@ class TripStateManager:
         self,
         current_time_seconds: int,
         force_all: bool = False,
+        static_lookup_cb=None,
     ) -> tuple[list[FinalizedTrip], list[SegmentDelayRecord], list[tuple[str, str, str, int]]]:
         """Examine in-memory trips, classify completed/expired ones, and evict them.
         
@@ -421,6 +440,7 @@ class TripStateManager:
                     service_date=tracker.service_date,
                     classification=outcome,
                     vehicle_id=tracker.vehicle_id,
+                    scheduled_start_time=tracker.gtfsr_start_time,
                     start_delay_seconds=start_delay,
                     end_delay_seconds=end_delay,
                     max_delay_seconds=max_delay,
@@ -430,6 +450,9 @@ class TripStateManager:
                     first_operated_stop_id=first_obs_id,
                     last_operated_stop_id=last_obs_id,
                     is_short_turned=is_short_turned,
+                    gtfsr_start_time=tracker.gtfsr_start_time,
+                    trip_headsign=tracker.trip_headsign,
+                    first_stop_name=tracker.first_stop_name,
                 )
                 finalized.append(finalized_trip)
                 to_evict.append(instance_id)

@@ -8,17 +8,28 @@ DB_PATH_LOCAL="data/nta_stats.db"
 run_sql() {
   local sql="$1"
   if command -v podman >/dev/null 2>&1 && podman ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-    podman exec -i "${CONTAINER_NAME}" sqlite3 -header -column "${DB_PATH_CONTAINER}" <<< "$sql"
+    PODMAN_IGNORE_CGROUPSV1_WARNING=1 podman exec "${CONTAINER_NAME}" sqlite3 -header -column "${DB_PATH_CONTAINER}" "$sql"
   elif command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-    docker exec -i "${CONTAINER_NAME}" sqlite3 -header -column "${DB_PATH_CONTAINER}" <<< "$sql"
+    docker exec "${CONTAINER_NAME}" sqlite3 -header -column "${DB_PATH_CONTAINER}" "$sql"
   elif [ -f "${DB_PATH_LOCAL}" ]; then
-    sqlite3 -header -column "${DB_PATH_LOCAL}" <<< "$sql"
+    sqlite3 -header -column "${DB_PATH_LOCAL}" "$sql"
   else
     echo "Error: Could not find running container '${CONTAINER_NAME}' (podman/docker) or local DB at '${DB_PATH_LOCAL}'." >&2
     exit 1
   fi
 }
 
+echo "=================================================================="
+echo " 0. DATABASE STATUS"
+echo "=================================================================="
+run_sql "
+SELECT
+    (SELECT COUNT(*) FROM static_trips) AS static_trips_loaded,
+    (SELECT COUNT(*) FROM trips_finalized) AS finalized_trips,
+    (SELECT COUNT(*) FROM stop_daily_stats) AS stop_stats_rows;
+"
+
+echo ""
 echo "=================================================================="
 echo " 1. OVERALL RELIABILITY BREAKDOWN (Tracked Vehicles & Cancellations)"
 echo "=================================================================="
@@ -73,6 +84,29 @@ ORDER BY canceled_count DESC;
 
 echo ""
 echo "=================================================================="
+echo " 3b. RECENT CANCELED TRIPS (With Departure Time & Origin/Dest)"
+echo "=================================================================="
+run_sql "
+SELECT 
+    r.route_short_name AS route,
+    COALESCE(
+        t.gtfsr_start_time,
+        printf('%02d:%02d:00', st.scheduled_start_seconds / 3600, (st.scheduled_start_seconds % 3600) / 60)
+    ) AS sched_start,
+    COALESCE(t.first_stop_name, fs.stop_name) AS origin_stop,
+    COALESCE(t.trip_headsign, st.trip_headsign) AS destination,
+    t.finalized_at
+FROM trips_finalized t
+JOIN static_routes r ON t.route_id = r.route_id
+LEFT JOIN static_trips st ON t.trip_id = st.trip_id
+LEFT JOIN static_stops fs ON st.first_stop_id = fs.stop_id
+WHERE t.classification = 'CANCELED'
+ORDER BY t.finalized_at DESC
+LIMIT 20;
+"
+
+echo ""
+echo "=================================================================="
 echo " 4. TIMETABLE PADDING EXPOSED (GPS-Tracked Bus/Rail, Excl. Luas)"
 echo "=================================================================="
 run_sql "
@@ -123,6 +157,11 @@ run_sql "
 SELECT 
     t.finalized_at,
     r.route_short_name AS route,
+    COALESCE(
+        t.gtfsr_start_time,
+        printf('%02d:%02d:00', st.scheduled_start_seconds / 3600, (st.scheduled_start_seconds % 3600) / 60)
+    ) AS sched_start,
+    COALESCE(t.trip_headsign, st.trip_headsign) AS destination,
     t.classification,
     t.vehicle_id,
     ROUND(t.end_delay_seconds / 60.0, 1) AS final_delay_mins,
@@ -130,6 +169,7 @@ SELECT
     t.operated_stop_count || '/' || t.scheduled_stop_count AS stops
 FROM trips_finalized t
 JOIN static_routes r ON t.route_id = r.route_id
+LEFT JOIN static_trips st ON t.trip_id = st.trip_id
 ORDER BY t.finalized_at DESC
 LIMIT 10;
 "

@@ -39,7 +39,7 @@ class FinalizedTrip:
     service_date: str
     classification: TripOutcome
     vehicle_id: str | None = None
-    
+
     scheduled_start_time: str | None = None
     scheduled_end_time: str | None = None
     actual_start_time: str | None = None
@@ -55,6 +55,11 @@ class FinalizedTrip:
     first_operated_stop_id: str | None = None
     last_operated_stop_id: str | None = None
     is_short_turned: bool = False
+
+    # Extra context captured from GTFS-R trip descriptor and static schedule
+    gtfsr_start_time: str | None = None   # e.g. "08:45:00" from GTFS-R
+    trip_headsign: str | None = None       # e.g. "Burlington Road" from static_trips
+    first_stop_name: str | None = None     # e.g. "Ongar Terminus" from static_stops
 
 
 @dataclass
