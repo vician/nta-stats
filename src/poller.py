@@ -52,9 +52,11 @@ class NTAPoller:
 
         self.static_manager = GTFSStaticManager(self.config, self.conn)
         self.tracker = TripStateManager(
-            ghost_grace_seconds=self.config.ghost_grace_minutes * 60
+            ghost_grace_seconds=self.config.ghost_grace_minutes * 60,
+            missed_ticks_threshold=6,
         )
         self.running = False
+        self._poll_counter = 0
 
         self.trip_updates_url = "https://api.nationaltransport.ie/gtfsr/v2/TripUpdates"
         self.vehicles_url = "https://api.nationaltransport.ie/gtfsr/v2/Vehicles"
@@ -125,9 +127,19 @@ class NTAPoller:
 
         self.tracker.begin_tick(service_date)
 
-        # 1. Fetch Feeds
-        tu_data = mock_trip_updates if mock_trip_updates is not None else self._fetch_feed(self.trip_updates_url)
-        veh_data = mock_vehicles if mock_vehicles is not None else self._fetch_feed(self.vehicles_url)
+        # 1. Fetch Feeds (alternate TripUpdates and Vehicles on live ticks to stay
+        # strictly within NTA's 1-request-per-60s Fair Usage Policy across the API key)
+        if mock_trip_updates is not None or mock_vehicles is not None:
+            tu_data = mock_trip_updates
+            veh_data = mock_vehicles
+        else:
+            if self._poll_counter % 2 == 0:
+                tu_data = self._fetch_feed(self.trip_updates_url)
+                veh_data = None
+            else:
+                tu_data = None
+                veh_data = self._fetch_feed(self.vehicles_url)
+            self._poll_counter += 1
 
         # 2. Process Vehicles (GPS)
         vehicles_processed = 0
